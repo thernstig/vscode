@@ -46,7 +46,7 @@ import * as resources from '../../../../base/common/resources.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { IExtensionManifest, ExtensionType, IExtension as IPlatformExtension, TargetPlatform, ExtensionIdentifier, IExtensionIdentifier, IExtensionDescription, isApplicationScopedExtension } from '../../../../platform/extensions/common/extensions.js';
+import { IExtensionManifest, ExtensionType, IExtension as IPlatformExtension, TargetPlatform, ExtensionIdentifier, IExtensionIdentifier, IExtensionDescription, isApplicationScopedExtension, isLanguagePackExtension } from '../../../../platform/extensions/common/extensions.js';
 import { ILanguageService } from '../../../../editor/common/languages/language.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { FileAccess } from '../../../../base/common/network.js';
@@ -1699,7 +1699,8 @@ export class ExtensionsWorkbenchService extends Disposable implements IExtension
 			throw new Error(`Extension not found. ${extension}`);
 		}
 		const useModal = this.configurationService.getValue<boolean>('extensions.allowOpenInModalEditor');
-		await this.editorService.openEditor(this.instantiationService.createInstance(ExtensionsInput, extension), options, options?.sideByside ? SIDE_GROUP : useModal ? MODAL_GROUP : ACTIVE_GROUP);
+		const editorOptions: IExtensionEditorOptions = { ...options, extension };
+		await this.editorService.openEditor(this.instantiationService.createInstance(ExtensionsInput, extension), editorOptions, options?.sideByside ? SIDE_GROUP : useModal ? MODAL_GROUP : ACTIVE_GROUP);
 	}
 
 	async openSearch(searchValue: string, preserveFocus?: boolean): Promise<void> {
@@ -2839,10 +2840,12 @@ export class ExtensionsWorkbenchService extends Disposable implements IExtension
 		}
 
 		if (extension.local.isApplicationScoped && this.userDataProfilesService.profiles.length > 1) {
+			const location = this.extensionsServers.length > 1 && !extension.isWorkspaceScoped && !isLanguagePackExtension(extension.local.manifest) ? extension.server?.label : undefined;
 			const { confirmed } = await this.dialogService.confirm({
 				title: nls.localize('uninstallApplicationScoped', "Uninstall Extension"),
 				type: Severity.Info,
 				message: nls.localize('uninstallApplicationScopedMessage', "Would you like to Uninstall {0} from all profiles?", extension.displayName),
+				detail: location ? nls.localize('uninstallApplicationScopedLocation', "Location: {0}", location) : undefined,
 				primaryButton: nls.localize('uninstallAllProfiles', "Uninstall (All Profiles)")
 			});
 			if (!confirmed) {

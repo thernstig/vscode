@@ -120,7 +120,9 @@ export class ExtensionsList extends Disposable {
 	}
 
 	private openExtension(extension: IExtension, options: { sideByside?: boolean; preserveFocus?: boolean; pinned?: boolean }): void {
-		extension = this.extensionsWorkbenchService.local.filter(e => areSameExtensions(e.identifier, extension.identifier))[0] || extension;
+		if (!extension.server) {
+			extension = this.extensionsWorkbenchService.local.find(e => areSameExtensions(e.identifier, extension.identifier)) || extension;
+		}
 		this.extensionsWorkbenchService.open(extension, {
 			...options,
 			modal: options.sideByside ? undefined : buildModalNavigationForPagedList(

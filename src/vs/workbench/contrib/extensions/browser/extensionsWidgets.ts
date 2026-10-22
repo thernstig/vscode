@@ -518,6 +518,43 @@ export class RemoteBadgeWidget extends ExtensionWidget {
 	}
 }
 
+export class ExtensionLocationWidget extends ExtensionWidget {
+
+	private readonly element: HTMLElement;
+
+	constructor(
+		parent: HTMLElement,
+		@IExtensionManagementServerService private readonly extensionManagementServerService: IExtensionManagementServerService,
+		@ILabelService labelService: ILabelService,
+		@IHoverService hoverService: IHoverService,
+	) {
+		super();
+		this.element = append(parent, $('.extension-location', { 'aria-live': 'polite', 'aria-atomic': 'true' }));
+		this.element.hidden = true;
+		this._register(hoverService.setupDelayedHover(this.element, () => ({ content: this.element.textContent ?? '' })));
+		this._register(labelService.onDidChangeFormatters(() => this.render()));
+		this._register(toDisposable(() => this.element.remove()));
+	}
+
+	render(): void {
+		const servers = [
+			this.extensionManagementServerService.localExtensionManagementServer,
+			this.extensionManagementServerService.remoteExtensionManagementServer,
+			this.extensionManagementServerService.webExtensionManagementServer,
+		].filter(server => !!server);
+		// The location identifies the editor's target, including after its installation is removed.
+		const location = this.extension?.server && servers.length > 1
+			? this.extension.isWorkspaceScoped ? localize('workspaceLocation', "Workspace") : this.extension.server.label
+			: undefined;
+		const label = location ? localize('extensionLocation', "Location: {0}", location) : '';
+		if (this.element.textContent === label) {
+			return;
+		}
+		this.element.textContent = label;
+		this.element.hidden = !label;
+	}
+}
+
 export class ExtensionIconBadge extends Disposable {
 
 	readonly element: HTMLElement;

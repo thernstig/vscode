@@ -64,6 +64,8 @@ import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.j
 import { IMeteredConnectionService } from '../../../../../platform/meteredConnection/common/meteredConnection.js';
 import { ExtensionGalleryManifestStatus, IExtensionGalleryManifestService } from '../../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
 import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
+import { ACTIVE_GROUP, IEditorService, MODAL_GROUP, SIDE_GROUP } from '../../../../services/editor/common/editorService.js';
+import { ExtensionsInput, IExtensionEditorOptions } from '../../common/extensionsInput.js';
 
 suite('ExtensionsWorkbenchServiceTest', () => {
 
@@ -1871,6 +1873,32 @@ suite('ExtensionsWorkbenchServiceTest', () => {
 		assert.deepStrictEqual(testObject.getEnabledAutoUpdateExtensions(), []);
 		assert.deepStrictEqual(testObject.getDisabledAutoUpdateExtensions(), []);
 	});
+
+	for (const [name, modal, sideByside, expectedGroup] of [
+		['active', false, false, ACTIVE_GROUP],
+		['modal', true, false, MODAL_GROUP],
+		['side', true, true, SIDE_GROUP],
+	] as const) {
+		test(`passes the requested installation through editor options for the ${name} group`, async () => {
+			instantiationService.stubPromise(IExtensionManagementService, 'getInstalled', [aLocalExtension()]);
+			const openEditor = sinon.stub().resolves(undefined);
+			instantiationService.stub(IEditorService, { openEditor });
+			testObject = await aWorkbenchService();
+			await instantiationService.get(IConfigurationService).updateValue('extensions.allowOpenInModalEditor', modal);
+			const extension = testObject.local[0];
+			const options = { sideByside, pinned: true, preserveFocus: true };
+
+			await testObject.open(extension, options);
+
+			const [input, actualOptions, group] = openEditor.firstCall.args as [ExtensionsInput, IExtensionEditorOptions, number];
+			disposableStore.add(input);
+			assert.deepStrictEqual({ extension: input.extension, options: actualOptions, group }, {
+				extension,
+				options: { ...options, extension },
+				group: expectedGroup,
+			});
+		});
+	}
 
 	async function aWorkbenchService(): Promise<ExtensionsWorkbenchService> {
 		const workbenchService: ExtensionsWorkbenchService = disposableStore.add(instantiationService.createInstance(ExtensionsWorkbenchService));

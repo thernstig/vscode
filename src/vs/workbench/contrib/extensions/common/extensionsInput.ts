@@ -19,6 +19,8 @@ import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js'
 const ExtensionEditorIcon = registerIcon('extensions-editor-label-icon', Codicon.extensions, localize('extensionsEditorLabelIcon', 'Icon of the extensions editor label.'));
 
 export interface IExtensionEditorOptions extends IEditorOptions {
+	/** The requested installation, including when an existing editor input is reused. */
+	extension?: IExtension;
 	showPreReleaseVersion?: boolean;
 	tab?: ExtensionEditorTab;
 	feature?: string;
@@ -49,6 +51,16 @@ export class ExtensionsInput extends EditorInput {
 	}
 
 	get extension(): IExtension { return this._extension; }
+
+	/** Updates the selected installation without changing this input's extension identity. */
+	updateExtension(extension: IExtension): boolean {
+		if (this._extension === extension || !areSameExtensions(this._extension.identifier, extension.identifier)) {
+			return false;
+		}
+		this._extension = extension;
+		this._onDidChangeLabel.fire();
+		return true;
+	}
 
 	override getName(): string {
 		return localize('extensionsInputName', "Extension: {0}", this._extension.displayName);

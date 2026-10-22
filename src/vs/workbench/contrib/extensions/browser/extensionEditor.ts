@@ -11,7 +11,7 @@ import { CheckboxActionViewItem } from '../../../../base/browser/ui/toggle/toggl
 import { Action, IAction } from '../../../../base/common/actions.js';
 import * as arrays from '../../../../base/common/arrays.js';
 import { Cache, CacheResult } from '../../../../base/common/cache.js';
-import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource, cancelOnDispose } from '../../../../base/common/cancellation.js';
 import { isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
@@ -54,10 +54,8 @@ import {
 	ExtensionEditorManageExtensionAction,
 	ExtensionStatusAction,
 	ExtensionStatusLabelAction,
-	InstallAnotherVersionAction,
 	InstallDropdownAction, InstallingLabelAction,
 	LocalInstallAction,
-	MigrateDeprecatedExtensionAction,
 	ExtensionRuntimeStateAction,
 	RemoteInstallAction,
 	SetColorThemeAction,
@@ -65,14 +63,14 @@ import {
 	SetLanguageAction,
 	SetProductIconThemeAction,
 	ToggleAutoUpdateForExtensionAction,
-	UninstallAction,
+	UninstallDropdownAction,
 	UpdateAction,
 	WebInstallAction,
 	TogglePreReleaseExtensionAction,
 } from './extensionsActions.js';
 import { Delegate } from './extensionsList.js';
 import { ExtensionData, ExtensionsGridView, ExtensionsTree, getExtensions } from './extensionsViewer.js';
-import { ExtensionRecommendationWidget, ExtensionStatusWidget, ExtensionWidget, InstallCountWidget, RatingsWidget, RemoteBadgeWidget, SponsorWidget, PublisherWidget, onClick, ExtensionKindIndicatorWidget, ExtensionIconWidget } from './extensionsWidgets.js';
+import { ExtensionRecommendationWidget, ExtensionStatusWidget, ExtensionWidget, InstallCountWidget, RatingsWidget, RemoteBadgeWidget, SponsorWidget, PublisherWidget, onClick, ExtensionKindIndicatorWidget, ExtensionIconWidget, ExtensionLocationWidget } from './extensionsWidgets.js';
 import { ExtensionContainers, ExtensionEditorTab, ExtensionState, IExtension, IExtensionContainer, IExtensionsWorkbenchService } from '../common/extensions.js';
 import { ExtensionsInput, IExtensionEditorOptions } from '../common/extensionsInput.js';
 import { DEFAULT_MARKDOWN_STYLES, renderMarkdownDocument } from '../../markdown/browser/markdownDocumentRenderer.js';
@@ -327,6 +325,7 @@ export class ExtensionEditor extends EditorPane {
 		];
 
 		const description = append(details, $('.description'));
+		widgets.push(this.instantiationService.createInstance(ExtensionLocationWidget, details));
 
 		const installAction = this.instantiationService.createInstance(InstallDropdownAction);
 		const actions = [
@@ -347,13 +346,7 @@ export class ExtensionEditor extends EditorPane {
 			this.instantiationService.createInstance(WebInstallAction),
 			installAction,
 			this.instantiationService.createInstance(InstallingLabelAction),
-			this.instantiationService.createInstance(ButtonWithDropDownExtensionAction, 'extensions.uninstall', UninstallAction.UninstallClass, [
-				[
-					this.instantiationService.createInstance(MigrateDeprecatedExtensionAction, false),
-					this.instantiationService.createInstance(UninstallAction),
-					this.instantiationService.createInstance(InstallAnotherVersionAction, null, true),
-				]
-			]),
+			this.instantiationService.createInstance(UninstallDropdownAction),
 			this.instantiationService.createInstance(ToggleAutoUpdateForExtensionAction),
 			new ExtensionEditorManageExtensionAction(this.scopedContextKeyService || this.contextKeyService, this.instantiationService),
 		];
@@ -462,6 +455,9 @@ export class ExtensionEditor extends EditorPane {
 	}
 
 	override async setInput(input: ExtensionsInput, options: IExtensionEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {
+		if (options?.extension) {
+			input.updateExtension(options.extension);
+		}
 		await super.setInput(input, options, context, token);
 		this.updatePreReleaseVersionContext();
 		if (this.template) {
@@ -471,11 +467,16 @@ export class ExtensionEditor extends EditorPane {
 
 	override setOptions(options: IExtensionEditorOptions | undefined): void {
 		const currentOptions: IExtensionEditorOptions | undefined = this.options;
+		const input = this.input as ExtensionsInput | undefined;
+		const extensionChanged = !!(options?.extension && input?.updateExtension(options.extension));
+		if (extensionChanged && !options?.tab && this.template?.navbar.currentId) {
+			options = { ...options, tab: this.template.navbar.currentId as ExtensionEditorTab };
+		}
 		super.setOptions(options);
 		this.updatePreReleaseVersionContext();
 
-		if (this.input && this.template && currentOptions?.showPreReleaseVersion !== options?.showPreReleaseVersion) {
-			this.render((this.input as ExtensionsInput).extension, this.template, !!options?.preserveFocus);
+		if (input && this.template && (extensionChanged || currentOptions?.showPreReleaseVersion !== options?.showPreReleaseVersion)) {
+			this.render(input.extension, this.template, !!options?.preserveFocus).catch(error => this.onError(error));
 			return;
 		}
 
@@ -532,7 +533,7 @@ export class ExtensionEditor extends EditorPane {
 		this.activeElement = null;
 		this.transientDisposables.clear();
 
-		const token = this.transientDisposables.add(new CancellationTokenSource()).token;
+		const token = cancelOnDispose(this.transientDisposables);
 
 		const gallery = await this.getGalleryVersionToShow(extension, (this.options as IExtensionEditorOptions)?.showPreReleaseVersion);
 		if (token.isCancellationRequested) {

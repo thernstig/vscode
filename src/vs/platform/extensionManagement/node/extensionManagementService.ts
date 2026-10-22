@@ -116,6 +116,7 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 	async zip(extension: ILocalExtension): Promise<URI> {
 		this.logService.trace('ExtensionManagementService#zip', extension.identifier.id);
 		const files = await this.collectFiles(extension);
+		await this.fileService.createFolder(this.extensionsDownloader.extensionsDownloadDir);
 		const location = await zip(joinPath(this.extensionsDownloader.extensionsDownloadDir, generateUuid()).fsPath, files);
 		return URI.file(location);
 	}

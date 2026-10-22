@@ -180,6 +180,17 @@
 	margin-top: 10px;
 }
 
+.extension-editor > .header > .details > .extension-location {
+	margin-top: var(--vscode-spacing-size60);
+	color: var(--vscode-descriptionForeground);
+	font-size: var(--vscode-fontSize-body1);
+	font-weight: var(--vscode-fontWeight-regular);
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
 .extension-editor > .header > .details > .actions-status-container {
 	margin-top: 10px;
 	display: flex;
