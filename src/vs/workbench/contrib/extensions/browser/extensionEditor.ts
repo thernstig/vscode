@@ -64,6 +64,7 @@ import {
 	SetProductIconThemeAction,
 	ToggleAutoUpdateForExtensionAction,
 	UninstallDropdownAction,
+	UninstallInOtherServerAction,
 	UpdateAction,
 	WebInstallAction,
 	TogglePreReleaseExtensionAction,
@@ -72,6 +73,7 @@ import { Delegate } from './extensionsList.js';
 import { ExtensionData, ExtensionsGridView, ExtensionsTree, getExtensions } from './extensionsViewer.js';
 import { ExtensionRecommendationWidget, ExtensionStatusWidget, ExtensionWidget, InstallCountWidget, RatingsWidget, RemoteBadgeWidget, SponsorWidget, PublisherWidget, onClick, ExtensionKindIndicatorWidget, ExtensionIconWidget, ExtensionLocationWidget } from './extensionsWidgets.js';
 import { ExtensionContainers, ExtensionEditorTab, ExtensionState, IExtension, IExtensionContainer, IExtensionsWorkbenchService } from '../common/extensions.js';
+import { IExtensionManagementServerService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { ExtensionsInput, IExtensionEditorOptions } from '../common/extensionsInput.js';
 import { DEFAULT_MARKDOWN_STYLES, renderMarkdownDocument } from '../../markdown/browser/markdownDocumentRenderer.js';
 import { IWebview, IWebviewService, KEYBINDING_CONTEXT_WEBVIEW_FIND_WIDGET_FOCUSED } from '../../webview/browser/webview.js';
@@ -251,6 +253,7 @@ export class ExtensionEditor extends EditorPane {
 		@IContextMenuService private readonly contextMenuService: IContextMenuService,
 		@IContextKeyService private readonly contextKeyService: IContextKeyService,
 		@IHoverService private readonly hoverService: IHoverService,
+		@IExtensionManagementServerService private readonly extensionManagementServerService: IExtensionManagementServerService,
 	) {
 		super(ExtensionEditor.ID, group, telemetryService, themeService, storageService);
 		this.extensionReadme = null;
@@ -328,6 +331,10 @@ export class ExtensionEditor extends EditorPane {
 		widgets.push(this.instantiationService.createInstance(ExtensionLocationWidget, details));
 
 		const installAction = this.instantiationService.createInstance(InstallDropdownAction);
+		const { localExtensionManagementServer, remoteExtensionManagementServer, webExtensionManagementServer } = this.extensionManagementServerService;
+		const otherServerUninstallActions = [localExtensionManagementServer, remoteExtensionManagementServer, webExtensionManagementServer]
+			.filter(server => !!server)
+			.map(server => this.instantiationService.createInstance(UninstallInOtherServerAction, server, 'selectedUninstalled'));
 		const actions = [
 			this.instantiationService.createInstance(ExtensionRuntimeStateAction),
 			this.instantiationService.createInstance(ExtensionStatusLabelAction),
@@ -347,6 +354,7 @@ export class ExtensionEditor extends EditorPane {
 			installAction,
 			this.instantiationService.createInstance(InstallingLabelAction),
 			this.instantiationService.createInstance(UninstallDropdownAction),
+			...otherServerUninstallActions,
 			this.instantiationService.createInstance(ToggleAutoUpdateForExtensionAction),
 			new ExtensionEditorManageExtensionAction(this.scopedContextKeyService || this.contextKeyService, this.instantiationService),
 		];

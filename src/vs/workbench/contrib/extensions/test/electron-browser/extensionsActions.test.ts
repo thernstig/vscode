@@ -5,9 +5,9 @@
 
 import assert from 'assert';
 import { generateUuid } from '../../../../../base/common/uuid.js';
-import { IExtensionsWorkbenchService, ExtensionContainers, IExtension as IWorkbenchExtension } from '../../common/extensions.js';
+import { IExtensionsWorkbenchService, ExtensionContainers, IExtension as IWorkbenchExtension, ExtensionState } from '../../common/extensions.js';
 import * as ExtensionsActions from '../../browser/extensionsActions.js';
-import { ExtensionsWorkbenchService } from '../../browser/extensionsWorkbenchService.js';
+import { Extension, ExtensionsWorkbenchService } from '../../browser/extensionsWorkbenchService.js';
 import {
 	IExtensionManagementService, IExtensionGalleryService, ILocalExtension, IGalleryExtension,
 	DidUninstallExtensionEvent, InstallExtensionEvent, IExtensionIdentifier, InstallOperation, IExtensionTipsService, InstallExtensionResult, getTargetPlatform, IExtensionsControlManifest, UninstallExtensionEvent, Metadata, IAllowedExtensionsService
@@ -997,8 +997,16 @@ suite('UninstallDropdownAction', () => {
 	async function setupInstallations(local: ILocalExtension[], remote: ILocalExtension[], web?: ILocalExtension[]) {
 		const localService = createExtensionManagementService(local);
 		const remoteService = createExtensionManagementService(remote);
+		const localWillUninstall = disposables.add(new Emitter<UninstallExtensionEvent>());
+		const localDidUninstall = disposables.add(new Emitter<DidUninstallExtensionEvent>());
 		const remoteDidUninstall = disposables.add(new Emitter<DidUninstallExtensionEvent>());
+		const remoteWillInstall = disposables.add(new Emitter<InstallExtensionEvent>());
+		const remoteDidInstall = disposables.add(new Emitter<readonly InstallExtensionResult[]>());
+		localService.onUninstallExtension = localWillUninstall.event;
+		localService.onDidUninstallExtension = localDidUninstall.event;
 		remoteService.onDidUninstallExtension = remoteDidUninstall.event;
+		remoteService.onInstallExtension = remoteWillInstall.event;
+		remoteService.onDidInstallExtensions = remoteDidInstall.event;
 		const servers = aMultiExtensionManagementServerService(instantiationService, localService, remoteService, web ? createExtensionManagementService(web) : undefined);
 		Object.defineProperty(servers.remoteExtensionManagementServer, 'label', { value: 'WSL: Ubuntu' });
 		instantiationService.stub(IExtensionManagementServerService, servers);
@@ -1008,8 +1016,115 @@ suite('UninstallDropdownAction', () => {
 		await workbenchService.queryLocal();
 		const action = disposables.add(instantiationService.createInstance(ExtensionsActions.UninstallDropdownAction));
 		disposables.add(instantiationService.createInstance(ExtensionContainers, [action]));
-		return { action, workbenchService, servers, remoteDidUninstall };
+		return { action, workbenchService, servers, localWillUninstall, localDidUninstall, remoteDidUninstall, remoteWillInstall, remoteDidInstall };
 	}
+
+	suite('adjacent other-location uninstall', () => {
+		function createSecondary(server: IExtensionManagementServer, selected: IWorkbenchExtension) {
+			const action = disposables.add(instantiationService.createInstance(ExtensionsActions.UninstallInOtherServerAction, server, 'selectedUninstalled'));
+			const containers = disposables.add(instantiationService.createInstance(ExtensionContainers, [action]));
+			containers.extension = selected;
+			return action;
+		}
+
+		for (const selectedLocation of ['local', 'remote'] as const) {
+			test('offers a separate uninstall after removing the selected ' + selectedLocation + ' copy', async () => {
+				const { action, workbenchService, servers, localDidUninstall, remoteDidUninstall } = await setupInstallations([aLocalExtension('a')], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })]);
+				const local = workbenchService.installed.find(extension => extension.server === servers.localExtensionManagementServer)!;
+				const remote = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+				const selected = selectedLocation === 'local' ? local : remote;
+				const other = selectedLocation === 'local' ? remote : local;
+				const secondary = createSecondary(other.server!, selected);
+				const label = selectedLocation === 'local' ? 'Uninstall from WSL: Ubuntu' : 'Uninstall Locally';
+				action.extension = selected;
+				assert.deepStrictEqual({ secondaryHidden: secondary.hidden, alternate: action.menuActions.some(item => item.label === label) }, { secondaryHidden: true, alternate: true });
+
+				(selectedLocation === 'local' ? localDidUninstall : remoteDidUninstall).fire({ identifier: selected.identifier, profileLocation: null! });
+				assert.deepStrictEqual({ mainHidden: action.hidden, mainMenu: action.menuActions, secondaryHidden: secondary.hidden, enabled: secondary.enabled, label: secondary.label }, {
+					mainHidden: true, mainMenu: [], secondaryHidden: false, enabled: true, label,
+				});
+				const removed: IWorkbenchExtension[] = [];
+				instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'uninstall', async (extension: IWorkbenchExtension) => { removed.push(extension); });
+				await action.run();
+				await secondary.run();
+				assert.deepStrictEqual({ removed, selected: secondary.extension }, { removed: [other], selected });
+			});
+		}
+
+		test('counterpart removal hides the secondary button and invalidates a stale invocation', async () => {
+			const { workbenchService, servers, localWillUninstall, localDidUninstall, remoteDidUninstall } = await setupInstallations([aLocalExtension('a')], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })]);
+			const selected = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+			remoteDidUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			const secondary = createSecondary(servers.localExtensionManagementServer!, selected);
+			assert.ok(secondary.enabled);
+			const removed: IWorkbenchExtension[] = [];
+			instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'uninstall', async (extension: IWorkbenchExtension) => { removed.push(extension); });
+			localWillUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			await secondary.run();
+			assert.deepStrictEqual({ hidden: secondary.hidden, enabled: secondary.enabled, removed }, { hidden: true, enabled: false, removed: [] });
+			localDidUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			await secondary.run();
+			assert.deepStrictEqual({ hidden: secondary.hidden, removed }, { hidden: true, removed: [] });
+		});
+
+		test('changing selection never turns the secondary button into the selected installation action', async () => {
+			const { workbenchService, servers, remoteDidUninstall } = await setupInstallations([aLocalExtension('a')], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })]);
+			const local = workbenchService.installed.find(extension => extension.server === servers.localExtensionManagementServer)!;
+			const remote = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+			remoteDidUninstall.fire({ identifier: remote.identifier, profileLocation: null! });
+			const secondary = createSecondary(servers.localExtensionManagementServer!, remote);
+			assert.ok(secondary.enabled);
+			const removed: IWorkbenchExtension[] = [];
+			instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'uninstall', async (extension: IWorkbenchExtension) => { removed.push(extension); });
+			secondary.extension = local;
+			await secondary.run();
+			assert.deepStrictEqual({ hidden: secondary.hidden, enabled: secondary.enabled, removed }, { hidden: true, enabled: false, removed: [] });
+		});
+
+		test('hides the secondary button during reinstall and restores it after failure', async () => {
+			const { workbenchService, servers, remoteDidUninstall, remoteWillInstall, remoteDidInstall } = await setupInstallations([aLocalExtension('a')], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })]);
+			const selected = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+			remoteDidUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			const secondary = createSecondary(servers.localExtensionManagementServer!, selected);
+			assert.ok(secondary.enabled);
+			const gallery = aGalleryExtension('a');
+			remoteWillInstall.fire({ identifier: gallery.identifier, source: gallery, profileLocation: null! });
+			const removed: IWorkbenchExtension[] = [];
+			instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'uninstall', async (extension: IWorkbenchExtension) => { removed.push(extension); });
+			await secondary.run();
+			assert.deepStrictEqual({ hidden: secondary.hidden, enabled: secondary.enabled, removed }, { hidden: true, enabled: false, removed: [] });
+			remoteDidInstall.fire([{ identifier: gallery.identifier, source: gallery, operation: InstallOperation.Install, error: new Error('Install failed'), profileLocation: null! }]);
+			assert.deepStrictEqual({ hidden: secondary.hidden, enabled: secondary.enabled, label: secondary.label }, { hidden: false, enabled: true, label: 'Uninstall Locally' });
+		});
+
+		test('names browser and All Profiles targets independently of the selected installation', async () => {
+			const { workbenchService, servers, remoteDidUninstall } = await setupInstallations([aLocalExtension('a', {}, { isApplicationScoped: true })], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeUserData, path: '/pub.a' }) })]);
+			const selected = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+			remoteDidUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			const actions = [createSecondary(servers.localExtensionManagementServer!, selected), createSecondary(servers.webExtensionManagementServer!, selected)];
+			const removed: IWorkbenchExtension[] = [];
+			instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'uninstall', async (extension: IWorkbenchExtension) => { removed.push(extension); });
+			for (const action of actions) {
+				await action.run();
+			}
+			assert.deepStrictEqual({ labels: actions.map(action => action.label), servers: removed.map(extension => extension.server) }, {
+				labels: ['Uninstall Locally (All Profiles)', 'Uninstall from Browser'],
+				servers: [servers.localExtensionManagementServer, servers.webExtensionManagementServer],
+			});
+		});
+
+		for (const excluded of ['built-in', 'workspace', 'language pack'] as const) {
+			test('does not offer an individual-location uninstall for a ' + excluded + ' target', async () => {
+				const manifest = excluded === 'language pack' ? { contributes: { localizations: [{ languageId: 'de', translations: [] }] } } : {};
+				const local = aLocalExtension('a', manifest, { type: excluded === 'built-in' ? ExtensionType.System : ExtensionType.User, isWorkspaceScoped: excluded === 'workspace' });
+				const { workbenchService, servers, remoteDidUninstall } = await setupInstallations([local], [aLocalExtension('a', {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: '/pub.a' }) })]);
+				const selected = workbenchService.installed.find(extension => extension.server === servers.remoteExtensionManagementServer)!;
+				remoteDidUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+				const action = createSecondary(servers.localExtensionManagementServer!, selected);
+				assert.deepStrictEqual({ hidden: action.hidden, enabled: action.enabled }, { hidden: true, enabled: false });
+			});
+		}
+	});
 
 	for (const selectedLocation of ['local', 'remote'] as const) {
 		test(`uninstalls the selected ${selectedLocation} installation and offers the other installation explicitly`, async () => {
@@ -1153,6 +1268,83 @@ suite('UninstallDropdownAction', () => {
 			assert.deepStrictEqual(errors, error instanceof CancellationError ? [] : ['Uninstall failed']);
 		});
 	}
+});
+
+suite('ExtensionStatusLabelAction', () => {
+
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+	let localServer: IExtensionManagementServer;
+	let remoteServer: IExtensionManagementServer;
+
+	setup(() => {
+		setupTest(disposables);
+		const servers = aMultiExtensionManagementServerService(instantiationService);
+		localServer = servers.localExtensionManagementServer!;
+		remoteServer = servers.remoteExtensionManagementServer!;
+		instantiationService.stub(IExtensionManagementServerService, servers);
+		instantiationService.stub(IExtensionService, {
+			extensions: [], onDidChangeExtensions: Event.None,
+			canAddExtension: () => true, canRemoveExtension: () => true,
+		});
+	});
+
+	function createExtension(server: IExtensionManagementServer | undefined, state: () => ExtensionState, version = '1.0.0', enablementState = EnablementState.EnabledGlobally): Extension {
+		const local = aLocalExtension('a', { version, extensionKind: ['workspace'], main: 'main.js' }, {
+			location: URI.from({ scheme: server === remoteServer ? Schemas.vscodeRemote : Schemas.file, path: '/pub.a' }),
+		});
+		const extension = instantiationService.createInstance(Extension, state, () => undefined, server, local, undefined, undefined);
+		extension.enablementState = enablementState;
+		return extension;
+	}
+
+	test('switching between differently enabled local and remote installations does not report enablement changes', () => {
+		const action = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+		const local = createExtension(localServer, () => ExtensionState.Installed, '1.0.0', EnablementState.DisabledByExtensionKind);
+		const remote = createExtension(remoteServer, () => ExtensionState.Installed);
+		const labels = [local, remote, local].map(extension => {
+			action.extension = extension;
+			return { label: action.label, hidden: action.class?.includes(' hide') };
+		});
+		assert.deepStrictEqual(labels, [{ label: '', hidden: true }, { label: '', hidden: true }, { label: '', hidden: true }]);
+	});
+
+	for (const initialState of [ExtensionState.Uninstalled, ExtensionState.Installed]) {
+		test(`switching away from an ${initialState === ExtensionState.Uninstalled ? 'installing' : 'updating'} installation does not report completion on the other server`, () => {
+			let state = initialState;
+			const action = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+			action.extension = createExtension(localServer, () => state);
+			state = ExtensionState.Installing;
+			action.update();
+			action.extension = createExtension(remoteServer, () => ExtensionState.Installed, '2.0.0');
+			assert.deepStrictEqual({ label: action.label, hidden: action.class?.includes(' hide') }, { label: '', hidden: true });
+		});
+
+		test(`a replacement model on the same server preserves ${initialState === ExtensionState.Uninstalled ? 'installation' : 'update'} completion`, () => {
+			let state = initialState;
+			const action = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+			action.extension = createExtension(localServer, () => state);
+			state = ExtensionState.Installing;
+			action.update();
+			action.extension = createExtension(localServer, () => ExtensionState.Installed, '2.0.0');
+			assert.deepStrictEqual({ label: action.label, hidden: action.class?.includes(' hide') }, {
+				label: initialState === ExtensionState.Uninstalled ? 'Installed' : 'Updated', hidden: false,
+			});
+		});
+	}
+
+	test('binding a serverless Marketplace result to its installation preserves completion', () => {
+		let state = ExtensionState.Uninstalled;
+		const gallery = aGalleryExtension('a');
+		const model = instantiationService.createInstance(Extension, () => state, () => undefined, undefined, undefined, gallery, undefined);
+		const action = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+		action.extension = model;
+		state = ExtensionState.Installing;
+		action.update();
+		const installed = createExtension(localServer, () => ExtensionState.Installed);
+		installed.gallery = gallery;
+		action.extension = installed;
+		assert.deepStrictEqual({ label: action.label, hidden: action.class?.includes(' hide') }, { label: 'Installed', hidden: false });
+	});
 });
 
 suite('ExtensionRuntimeStateAction', () => {
@@ -1910,9 +2102,12 @@ suite('ExtensionRuntimeStateAction', () => {
 suite('ReinstallInSelectedServer', () => {
 
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
-	setup(() => setupTest(disposables));
+	setup(() => {
+		setupTest(disposables);
+		instantiationService.stub(IProgressService, { withProgress: (_options, task) => task({ report() { } }) });
+	});
 
-	async function setupRemovedInstallation(target: 'local' | 'remote' | 'web', gallery?: IGalleryExtension, sourceProperties: Partial<ILocalExtension> = {}, sourceLocation?: 'web') {
+	async function setupRemovedInstallation(target: 'local' | 'remote' | 'web', gallery?: IGalleryExtension, sourceProperties: Partial<ILocalExtension> = {}, sourceLocation?: 'web', removeTarget = true) {
 		const identifier = gallery?.identifier ?? { id: 'pub.a', uuid: generateUuid() };
 		const manifest = { extensionKind: ['workspace'], main: 'main.js', browser: 'browser.js' };
 		const targetScheme = target === 'local' ? Schemas.file : target === 'remote' ? Schemas.vscodeRemote : Schemas.vscodeUserData;
@@ -1920,9 +2115,15 @@ suite('ReinstallInSelectedServer', () => {
 		const removed = aLocalExtension('a', manifest, { identifier, location: URI.from({ scheme: targetScheme, path: '/pub.a' }) });
 		const source = aLocalExtension('a', manifest, { identifier, location: URI.from({ scheme: sourceScheme, path: '/pub.a' }), ...sourceProperties });
 		const didRemoveTarget = disposables.add(new Emitter<DidUninstallExtensionEvent>());
+		const targetWillUninstall = disposables.add(new Emitter<UninstallExtensionEvent>());
 		const didRemoveSource = disposables.add(new Emitter<DidUninstallExtensionEvent>());
+		const targetInstall = disposables.add(new Emitter<InstallExtensionEvent>());
+		const targetDidInstall = disposables.add(new Emitter<readonly InstallExtensionResult[]>());
 		const targetService = createExtensionManagementService([removed]);
 		targetService.onDidUninstallExtension = didRemoveTarget.event;
+		targetService.onUninstallExtension = targetWillUninstall.event;
+		targetService.onInstallExtension = targetInstall.event;
+		targetService.onDidInstallExtensions = targetDidInstall.event;
 		const sourceService = createExtensionManagementService([source]);
 		sourceService.onDidUninstallExtension = didRemoveSource.event;
 		const servers = aMultiExtensionManagementServerService(instantiationService,
@@ -1951,8 +2152,10 @@ suite('ReinstallInSelectedServer', () => {
 				: instantiationService.createInstance(ExtensionsActions.WebInstallAction));
 		disposables.add(instantiationService.createInstance(ExtensionContainers, [action]));
 		action.extension = selected;
-		didRemoveTarget.fire({ identifier, profileLocation: null! });
-		return { selected, installedSource, action, workbenchService, targetServer, didRemoveSource, didRemoveTarget, sourceService, targetService };
+		if (removeTarget) {
+			didRemoveTarget.fire({ identifier, profileLocation: null! });
+		}
+		return { selected, installedSource, action, workbenchService, targetServer, didRemoveSource, didRemoveTarget, sourceService, targetService, targetInstall, targetDidInstall, targetWillUninstall };
 	}
 
 	for (const target of ['local', 'remote'] as const) {
@@ -1972,6 +2175,131 @@ suite('ReinstallInSelectedServer', () => {
 		}
 	}
 
+	for (const target of ['local', 'remote'] as const) {
+		test(`shares destination-only progress across source and selected ${target} actions through completion`, async () => {
+			const { action, selected, installedSource, workbenchService, targetService, targetInstall, targetDidInstall, targetWillUninstall, didRemoveTarget } = await setupRemovedInstallation(target, undefined, {}, undefined, false);
+			const sourceInstall = disposables.add(target === 'local' ? instantiationService.createInstance(ExtensionsActions.LocalInstallAction) : instantiationService.createInstance(ExtensionsActions.RemoteInstallAction, false));
+			const sourceOtherInstall = disposables.add(target === 'local' ? instantiationService.createInstance(ExtensionsActions.RemoteInstallAction, false) : instantiationService.createInstance(ExtensionsActions.LocalInstallAction));
+			const targetOtherInstall = disposables.add(target === 'local' ? instantiationService.createInstance(ExtensionsActions.RemoteInstallAction, false) : instantiationService.createInstance(ExtensionsActions.LocalInstallAction));
+			const sourceProgress = disposables.add(instantiationService.createInstance(ExtensionsActions.InstallingLabelAction));
+			const sourceUninstall = disposables.add(instantiationService.createInstance(ExtensionsActions.UninstallAction));
+			const sourceManage = disposables.add(instantiationService.createInstance(ExtensionsActions.ManageExtensionAction));
+			const sourceStatus = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+			const targetProgress = disposables.add(instantiationService.createInstance(ExtensionsActions.InstallingLabelAction));
+			const targetUninstall = disposables.add(instantiationService.createInstance(ExtensionsActions.UninstallAction));
+			const targetManage = disposables.add(instantiationService.createInstance(ExtensionsActions.ManageExtensionAction));
+			const targetStatus = disposables.add(instantiationService.createInstance(ExtensionsActions.ExtensionStatusLabelAction));
+			const sourceContainers = disposables.add(instantiationService.createInstance(ExtensionContainers, [sourceInstall, sourceOtherInstall, sourceProgress, sourceUninstall, sourceManage, sourceStatus]));
+			const targetContainers = disposables.add(instantiationService.createInstance(ExtensionContainers, [targetProgress, targetOtherInstall, targetUninstall, targetManage, targetStatus]));
+			sourceContainers.extension = installedSource;
+			targetContainers.extension = selected;
+			targetWillUninstall.fire({ identifier: selected.identifier, profileLocation: null! });
+			assert.deepStrictEqual({ sourceUninstall: sourceUninstall.enabled, sourceManage: sourceManage.enabled, targetUninstall: targetUninstall.enabled, targetManage: targetManage.enabled, targetState: selected.state }, {
+				sourceUninstall: true, sourceManage: true, targetUninstall: false, targetManage: false, targetState: ExtensionState.Uninstalling,
+			});
+			didRemoveTarget.fire({ identifier: selected.identifier, profileLocation: null! });
+			assert.deepStrictEqual({ sourceStatus: sourceStatus.label, targetStatus: targetStatus.label, restore: action.enabled }, { sourceStatus: '', targetStatus: 'Uninstalled', restore: true });
+			const lookupStarted = new DeferredPromise<void>();
+			const lookupCompleted = new DeferredPromise<void>();
+			const backendStarted = new DeferredPromise<void>();
+			const backendCompleted = new DeferredPromise<void>();
+			const gallery: Mutable<IGalleryExtension> = aGalleryExtension('a');
+			gallery.identifier = { id: selected.identifier.id, uuid: selected.identifier.uuid! };
+			const galleryModel = instantiationService.createInstance(Extension, () => ExtensionState.Uninstalled, () => undefined, undefined, undefined, gallery, undefined);
+			instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'getExtensions', async () => {
+				await lookupStarted.complete();
+				await lookupCompleted.p;
+				return [galleryModel];
+			});
+			instantiationService.stubPromise(IExtensionsWorkbenchService, workbenchService, 'open', undefined);
+			let installs = 0;
+			targetService.installFromGallery = async () => {
+				installs++;
+				targetInstall.fire({ identifier: selected.identifier, source: gallery, profileLocation: null! });
+				targetDidInstall.fire([{ identifier: selected.identifier, source: gallery, local: selected.local!, operation: InstallOperation.Install, profileLocation: null! }]);
+				await backendStarted.complete();
+				await backendCompleted.p;
+				return selected.local!;
+			};
+			const progress = () => ({
+				sourceState: installedSource.state,
+				sourceProgress: { hidden: sourceProgress.hidden, cssHidden: sourceProgress.class?.includes(' hide') ?? false },
+				sourceUninstall: sourceUninstall.enabled,
+				sourceManage: sourceManage.enabled,
+				statusLabels: [sourceStatus.label, targetStatus.label],
+				sourceInstall: { enabled: sourceInstall.enabled, hidden: sourceInstall.hidden, label: sourceInstall.label },
+				otherInstallHidden: [sourceOtherInstall.hidden, targetOtherInstall.hidden],
+				targetUninstall: targetUninstall.enabled,
+				targetManage: { enabled: targetManage.enabled, cssHidden: targetManage.class?.includes(' hide') ?? false },
+				targetRestore: { enabled: action.enabled, hidden: action.hidden, cssInstalling: action.class?.includes(' installing') ?? false },
+				targetProgress: [action, targetOtherInstall, targetProgress].filter(item => !item.hidden && !item.class?.includes(' hide')).map(item => ({ label: item.label, enabled: item.enabled })),
+			});
+			const expected = {
+				sourceState: ExtensionState.Installed, sourceProgress: { hidden: true, cssHidden: true }, sourceUninstall: true, sourceManage: true, statusLabels: ['', ''],
+				sourceInstall: { enabled: false, hidden: false, label: target === 'local' ? 'Installing Locally' : 'Installing in remote' },
+				otherInstallHidden: [true, true], targetUninstall: false, targetManage: { enabled: false, cssHidden: true },
+				targetRestore: { enabled: false, hidden: true, cssInstalling: false }, targetProgress: [{ label: 'Installing', enabled: false }],
+			};
+			const run = action.run();
+			try {
+				await lookupStarted.p;
+				assert.deepStrictEqual(progress(), expected);
+				await sourceInstall.run();
+				await action.run();
+				await lookupCompleted.complete();
+				await backendStarted.p;
+				assert.deepStrictEqual(progress(), expected);
+				await backendCompleted.complete();
+				await run;
+				assert.deepStrictEqual({
+					installs, sourceState: installedSource.state, sourceProgressHidden: sourceProgress.hidden,
+					targetProgressHidden: targetProgress.hidden, restoreHidden: action.hidden, sourceInstallHidden: sourceInstall.hidden,
+					sourceUninstall: sourceUninstall.enabled, targetUninstall: targetUninstall.enabled,
+				}, {
+					installs: 1, sourceState: ExtensionState.Installed, sourceProgressHidden: true,
+					targetProgressHidden: true, restoreHidden: true, sourceInstallHidden: true,
+					sourceUninstall: true, targetUninstall: true,
+				});
+			} finally {
+				await lookupCompleted.complete();
+				await backendCompleted.complete();
+				await run;
+			}
+		});
+	}
+
+	test('restores retry controls on a fresh destination model after shared installation failure', async () => {
+		const { action, installedSource, workbenchService, targetServer } = await setupRemovedInstallation('remote');
+		const progress = disposables.add(instantiationService.createInstance(ExtensionsActions.InstallingLabelAction));
+		const containers = disposables.add(instantiationService.createInstance(ExtensionContainers, [progress]));
+		const lookupStarted = new DeferredPromise<void>();
+		const lookupCompleted = new DeferredPromise<void>();
+		instantiationService.stub(IExtensionsWorkbenchService, workbenchService, 'getExtensions', async () => {
+			await lookupStarted.complete();
+			await lookupCompleted.p;
+			throw new Error('Lookup failed');
+		});
+		instantiationService.stubPromise(IExtensionsWorkbenchService, workbenchService, 'open', undefined);
+		const run = action.run();
+		const failed = assert.rejects(run, /Lookup failed/);
+		try {
+			await lookupStarted.p;
+			const pending = workbenchService.installed.find(extension => extension.server === targetServer)!;
+			assert.strictEqual(pending.local, undefined);
+			action.extension = pending;
+			containers.extension = pending;
+			assert.deepStrictEqual({ restoreHidden: action.hidden, progressHidden: progress.hidden }, { restoreHidden: true, progressHidden: false });
+			await lookupCompleted.complete();
+			await failed;
+			assert.deepStrictEqual({ enabled: action.enabled, hidden: action.hidden, label: action.label, progressHidden: progress.hidden, sourceState: installedSource.state }, {
+				enabled: true, hidden: false, label: 'Install in remote', progressHidden: true, sourceState: ExtensionState.Installed,
+			});
+		} finally {
+			await lookupCompleted.complete();
+			await failed;
+		}
+	});
+
 	test('disables restoring the selected server while installation is in progress', async () => {
 		const { action, workbenchService } = await setupRemovedInstallation('remote');
 		const completion = new DeferredPromise<void>();
@@ -1980,7 +2308,7 @@ suite('ReinstallInSelectedServer', () => {
 		instantiationService.stubPromise(IExtensionsWorkbenchService, workbenchService, 'open', undefined);
 		const run = action.run();
 		await action.run();
-		assert.deepStrictEqual({ enabled: action.enabled, hidden: action.hidden, label: action.label, calls }, { enabled: false, hidden: false, label: 'Installing', calls: 1 });
+		assert.deepStrictEqual({ enabled: action.enabled, hidden: action.hidden, calls }, { enabled: false, hidden: true, calls: 1 });
 		await completion.complete();
 		await run;
 		assert.strictEqual(action.enabled, true);
@@ -2011,7 +2339,7 @@ suite('ReinstallInSelectedServer', () => {
 		await completionA.complete();
 		await runA;
 		await action.run();
-		assert.deepStrictEqual({ enabled: action.enabled, hidden: action.hidden, label: action.label, calls }, { enabled: false, hidden: false, label: 'Installing', calls: ['pub.a', 'pub.b'] });
+		assert.deepStrictEqual({ enabled: action.enabled, hidden: action.hidden, calls }, { enabled: false, hidden: true, calls: ['pub.a', 'pub.b'] });
 		await completionB.complete();
 		await runB;
 		assert.strictEqual(action.enabled, true);
@@ -2230,8 +2558,8 @@ suite('RemoteInstallAction', () => {
 		assert.strictEqual('extension-action label prominent install-other-server', testObject.class);
 
 		onInstallExtension.fire({ identifier: localWorkspaceExtension.identifier, source: gallery, profileLocation: null! });
-		assert.ok(testObject.enabled);
-		assert.strictEqual('Installing', testObject.label);
+		assert.ok(!testObject.enabled);
+		assert.strictEqual('Installing in remote', testObject.label);
 		assert.strictEqual('extension-action label install-other-server installing', testObject.class);
 	});
 
@@ -2263,8 +2591,8 @@ suite('RemoteInstallAction', () => {
 		assert.strictEqual('extension-action label prominent install-other-server', testObject.class);
 
 		onInstallExtension.fire({ identifier: localWorkspaceExtension.identifier, source: gallery, profileLocation: null! });
-		assert.ok(testObject.enabled);
-		assert.strictEqual('Installing', testObject.label);
+		assert.ok(!testObject.enabled);
+		assert.strictEqual('Installing in remote', testObject.label);
 		assert.strictEqual('extension-action label install-other-server installing', testObject.class);
 
 		const installedExtension = aLocalExtension('a', { extensionKind: ['workspace'] }, { location: URI.file(`pub.a`).with({ scheme: Schemas.vscodeRemote }) });
@@ -2682,8 +3010,8 @@ suite('LocalInstallAction', () => {
 		assert.strictEqual('extension-action label prominent install-other-server', testObject.class);
 
 		onInstallExtension.fire({ identifier: remoteUIExtension.identifier, source: gallery, profileLocation: null! });
-		assert.ok(testObject.enabled);
-		assert.strictEqual('Installing', testObject.label);
+		assert.ok(!testObject.enabled);
+		assert.strictEqual('Installing Locally', testObject.label);
 		assert.strictEqual('extension-action label install-other-server installing', testObject.class);
 	});
 
@@ -2715,8 +3043,8 @@ suite('LocalInstallAction', () => {
 		assert.strictEqual('extension-action label prominent install-other-server', testObject.class);
 
 		onInstallExtension.fire({ identifier: remoteUIExtension.identifier, source: gallery, profileLocation: null! });
-		assert.ok(testObject.enabled);
-		assert.strictEqual('Installing', testObject.label);
+		assert.ok(!testObject.enabled);
+		assert.strictEqual('Installing Locally', testObject.label);
 		assert.strictEqual('extension-action label install-other-server installing', testObject.class);
 
 		const installedExtension = aLocalExtension('a', { extensionKind: ['ui'] }, { location: URI.file(`pub.a`) });

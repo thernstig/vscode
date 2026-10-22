@@ -8,14 +8,14 @@ import assert from 'assert';
 import { DeferredPromise, timeout } from '../../../../../base/common/async.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { runWithFakedTimers } from '../../../../../base/test/common/virtualScheduling/index.js';
-import { ExtensionState, AutoCheckUpdatesConfigurationKey, AutoUpdateConfigurationKey, AutoUpdateDelayConfigurationKey, ExtensionRuntimeActionType, AutoUpdateConfigurationValue, IExtensionsWorkbenchService } from '../../common/extensions.js';
+import { ExtensionState, AutoCheckUpdatesConfigurationKey, AutoUpdateConfigurationKey, AutoUpdateDelayConfigurationKey, ExtensionRuntimeActionType, AutoUpdateConfigurationValue, IExtensionsWorkbenchService, IExtension, IExtensionContainer, ExtensionContainers } from '../../common/extensions.js';
 import { ExtensionsWorkbenchService } from '../../browser/extensionsWorkbenchService.js';
 import '../../browser/extensions.contribution.js';
 import {
 	IExtensionManagementService, IExtensionGalleryService, ILocalExtension, IGalleryExtension,
-	DidUninstallExtensionEvent, InstallExtensionEvent, IGalleryExtensionAssets, InstallOperation, IExtensionTipsService, InstallExtensionResult, getTargetPlatform, IExtensionsControlManifest, UninstallExtensionEvent, Metadata
+	DidUninstallExtensionEvent, InstallExtensionEvent, IGalleryExtensionAssets, InstallOperation, IExtensionTipsService, InstallExtensionResult, getTargetPlatform, IExtensionsControlManifest, UninstallExtensionEvent, Metadata, InstallOptions
 } from '../../../../../platform/extensionManagement/common/extensionManagement.js';
-import { IWorkbenchExtensionEnablementService, EnablementState, IExtensionManagementServerService, IExtensionManagementServer, IProfileAwareExtensionManagementService, IWorkbenchExtensionManagementService } from '../../../../services/extensionManagement/common/extensionManagement.js';
+import { IWorkbenchExtensionEnablementService, EnablementState, IExtensionManagementServerService, IExtensionManagementServer, IProfileAwareExtensionManagementService, IWorkbenchExtensionManagementService, DidChangeProfileEvent } from '../../../../services/extensionManagement/common/extensionManagement.js';
 import { IExtensionRecommendationsService } from '../../../../services/extensionRecommendations/common/extensionRecommendations.js';
 import { getGalleryExtensionId } from '../../../../../platform/extensionManagement/common/extensionManagementUtil.js';
 import { anExtensionManagementServerService, TestExtensionEnablementService } from '../../../../services/extensionManagement/test/browser/extensionEnablementService.test.js';
@@ -66,6 +66,8 @@ import { ExtensionGalleryManifestStatus, IExtensionGalleryManifestService } from
 import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
 import { ACTIVE_GROUP, IEditorService, MODAL_GROUP, SIDE_GROUP } from '../../../../services/editor/common/editorService.js';
 import { ExtensionsInput, IExtensionEditorOptions } from '../../common/extensionsInput.js';
+import { CancellationError } from '../../../../../base/common/errors.js';
+import { ExtensionStatusLabelAction, InstallingLabelAction } from '../../browser/extensionsActions.js';
 
 suite('ExtensionsWorkbenchServiceTest', () => {
 
@@ -643,6 +645,425 @@ suite('ExtensionsWorkbenchServiceTest', () => {
 				});
 			});
 		}
+	});
+
+	suite('installInServer progress', () => {
+		function createServer(id: string) {
+			const inventory: ILocalExtension[] = [];
+			const install = disposableStore.add(new Emitter<InstallExtensionEvent>());
+			const didInstall = disposableStore.add(new Emitter<readonly InstallExtensionResult[]>());
+			const uninstall = disposableStore.add(new Emitter<UninstallExtensionEvent>());
+			const didUninstall = disposableStore.add(new Emitter<DidUninstallExtensionEvent>());
+			const changeProfile = disposableStore.add(new Emitter<DidChangeProfileEvent>());
+			const service: IProfileAwareExtensionManagementService = {
+				...createExtensionManagementService(inventory),
+				onInstallExtension: install.event,
+				onDidInstallExtensions: didInstall.event,
+				onUninstallExtension: uninstall.event,
+				onDidUninstallExtension: didUninstall.event,
+				onDidChangeProfile: changeProfile.event,
+			};
+			const server: IExtensionManagementServer = { id, label: id, extensionManagementService: service };
+			return {
+				server, service, inventory, install, didInstall, changeProfile,
+				remove(extension: IExtension) {
+					uninstall.fire({ identifier: extension.identifier, profileLocation: null! });
+					inventory.splice(inventory.findIndex(local => local.identifier.id === extension.identifier.id), 1);
+					didUninstall.fire({ identifier: extension.identifier, profileLocation: null! });
+				},
+				complete(source: URI | IGalleryExtension, local: ILocalExtension, operation = InstallOperation.Install) {
+					const existing = inventory.findIndex(installed => installed.identifier.id === local.identifier.id);
+					if (existing === -1) {
+						inventory.push(local);
+					} else {
+						inventory[existing] = local;
+					}
+					didInstall.fire([{ identifier: local.identifier, source, local, operation, profileLocation: null! }]);
+				},
+			};
+		}
+
+		async function createFixture(names = ['a'], includeWeb = false) {
+			stubConfiguration(false, false);
+			instantiationService.stub(IProgressService, { withProgress: (_options, task) => task({ report() { } }) });
+			const local = createServer('local');
+			const remote = createServer('remote');
+			const web = createServer('web');
+			instantiationService.stub(IExtensionManagementServerService, anExtensionManagementServerService(local.server, remote.server, includeWeb ? web.server : null));
+			testObject = await aWorkbenchService();
+			const gallery = names.map(name => aGalleryExtension(name));
+			instantiationService.stubPromise(IExtensionGalleryService, 'query', aPage(...gallery));
+			const serverless = (await testObject.queryGallery(CancellationToken.None)).firstPage;
+			for (const name of names) {
+				for (const target of [local, remote]) {
+					target.inventory.push(aLocalExtension(name, { displayName: `Extension ${name}`, extensionKind: ['workspace'] }, {
+						location: URI.from({ scheme: target === local ? Schemas.file : Schemas.vscodeRemote, path: `/extensions/${target.server.id}/${name}` }),
+						targetPlatform: getTargetPlatform(platform, arch),
+					}));
+				}
+			}
+			await testObject.queryLocal();
+			return { local, remote, web, gallery, serverless };
+		}
+
+		function bind(extension: IExtension): IExtensionContainer {
+			const container: IExtensionContainer = { extension, update() { }, dispose() { } };
+			disposableStore.add(new ExtensionContainers([container], testObject));
+			return container;
+		}
+
+		for (const { name, fails, reinstall } of [
+			{ name: 'successful local update', fails: false, reinstall: false },
+			{ name: 'failed local update', fails: true, reinstall: false },
+			{ name: 'successful local reinstall', fails: false, reinstall: true },
+		]) {
+			test(`${name} refreshes bound progress when the remote copy remains primary`, async () => {
+				const fixture = await createFixture();
+				const local = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+				const remote = testObject.installed.find(extension => extension.server === fixture.remote.server)!;
+				const originalLocal = local.local!;
+				const gallery = aGalleryExtension('a', { version: '2.0.0' });
+				local.gallery = remote.gallery = gallery;
+				if (reinstall) {
+					fixture.local.remove(local);
+				}
+				assert.strictEqual(testObject.local[0], remote);
+				instantiationService.stub(IExtensionService, 'canAddExtension', () => true);
+				const localInstalling = disposableStore.add(new InstallingLabelAction());
+				const remoteInstalling = disposableStore.add(new InstallingLabelAction());
+				const localStatus = disposableStore.add(instantiationService.createInstance(ExtensionStatusLabelAction));
+				localInstalling.extension = local;
+				remoteInstalling.extension = remote;
+				localStatus.extension = local;
+				disposableStore.add(new ExtensionContainers([localInstalling, remoteInstalling, localStatus], testObject));
+				const installedNotifications: IExtension[] = [];
+				disposableStore.add(testObject.onChange(extension => {
+					if (extension?.state === ExtensionState.Installed) {
+						installedNotifications.push(extension);
+					}
+				}));
+				const started = new DeferredPromise<void>();
+				const finish = new DeferredPromise<void>();
+				const error = new Error('local update failed');
+				const updatedLocal = aLocalExtension('a', { ...originalLocal.manifest, version: '2.0.0' }, { location: originalLocal.location });
+				instantiationService.stub(IWorkbenchExtensionManagementService, 'updateFromGallery', async (installSource: IGalleryExtension, installed: ILocalExtension) => {
+					assert.strictEqual(installed, originalLocal);
+					fixture.local.install.fire({ identifier: local.identifier, source: installSource, profileLocation: null! });
+					await started.complete();
+					await finish.p;
+					if (fails) {
+						fixture.local.didInstall.fire([{ identifier: local.identifier, source: installSource, error, operation: InstallOperation.Update, profileLocation: null! }]);
+						throw error;
+					}
+					fixture.local.complete(installSource, updatedLocal, InstallOperation.Update);
+					// The return value and event payload need not share object identity across IPC.
+					return aLocalExtension('a', { ...updatedLocal.manifest }, { location: URI.revive(updatedLocal.location.toJSON()) });
+				});
+				const snapshot = () => ({
+					localState: local.state,
+					localProgressVisible: !localInstalling.hidden,
+					remoteState: remote.state,
+					remoteProgressVisible: !remoteInstalling.hidden,
+				});
+				const pending = testObject.install(local);
+				try {
+					await started.p;
+					assert.deepStrictEqual(snapshot(), {
+						localState: ExtensionState.Installing, localProgressVisible: true,
+						remoteState: ExtensionState.Installed, remoteProgressVisible: false,
+					});
+					const rejected = fails ? assert.rejects(pending, candidate => candidate === error) : undefined;
+					await finish.complete();
+					if (rejected) {
+						await rejected;
+					} else {
+						assert.strictEqual(await pending, remote);
+					}
+					assert.deepStrictEqual(snapshot(), {
+						localState: ExtensionState.Installed, localProgressVisible: false,
+						remoteState: ExtensionState.Installed, remoteProgressVisible: false,
+					});
+					if (!fails) {
+						assert.deepStrictEqual({ server: installedNotifications.at(-1)?.server, local: installedNotifications.at(-1)?.local }, {
+							server: fixture.local.server, local: updatedLocal,
+						});
+					}
+					if (reinstall) {
+						assert.strictEqual(localStatus.label, 'Installed');
+					}
+				} finally {
+					const settled = pending.catch(() => { });
+					await finish.complete();
+					await settled;
+				}
+			});
+		}
+
+		test('installEverywhere clears original-server progress without clearing destination completion status', async () => {
+			const fixture = await createFixture();
+			const local = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+			const retained = testObject.installed.find(extension => extension.server === fixture.remote.server)!;
+			fixture.remote.remove(retained);
+			local.gallery = retained.gallery = fixture.gallery[0];
+			instantiationService.stub(IExtensionService, 'canAddExtension', () => true);
+			const localInstalling = disposableStore.add(new InstallingLabelAction());
+			const remoteStatus = disposableStore.add(instantiationService.createInstance(ExtensionStatusLabelAction));
+			localInstalling.extension = local;
+			remoteStatus.extension = retained;
+			disposableStore.add(new ExtensionContainers([localInstalling, remoteStatus], testObject));
+			instantiationService.stub(IWorkbenchExtensionManagementService, 'getInstallableServers', async () => [fixture.local.server, fixture.remote.server]);
+			const installed = aLocalExtension('a', retained.local?.manifest, { location: retained.local!.location });
+			instantiationService.stub(IWorkbenchExtensionManagementService, 'installFromGallery', async (gallery: IGalleryExtension, _options: InstallOptions, servers?: IExtensionManagementServer[]) => {
+				assert.deepStrictEqual(servers, [fixture.remote.server]);
+				fixture.remote.install.fire({ identifier: gallery.identifier, source: gallery, profileLocation: null! });
+				fixture.remote.complete(gallery, installed);
+				return installed;
+			});
+
+			const result = await testObject.install(local, { installEverywhere: true });
+			assert.deepStrictEqual({
+				resultServer: result.server,
+				localState: local.state,
+				localProgressVisible: !localInstalling.hidden,
+				remoteStatus: remoteStatus.label,
+			}, { resultServer: fixture.remote.server, localState: ExtensionState.Installed, localProgressVisible: false, remoteStatus: 'Installed' });
+		});
+
+		for (const destination of ['local', 'remote'] as const) {
+			for (const transport of ['VSIX', 'gallery'] as const) {
+				test(`${transport} installation tracks ${destination} through preparation and completion`, async () => {
+					const fixture = await createFixture();
+					const target = fixture[destination];
+					const sourceServer = fixture[destination === 'local' ? 'remote' : 'local'];
+					const source = testObject.installed.find(extension => extension.server === sourceServer.server)!;
+					const retained = testObject.installed.find(extension => extension.server === target.server)!;
+					const container = bind(retained);
+					target.remove(retained);
+					const gallery = fixture.gallery[0];
+					if (transport === 'gallery') {
+						source.gallery = gallery;
+						retained.gallery = gallery;
+					}
+					const idleGalleryState = fixture.serverless[0].state;
+					const lookup = new DeferredPromise<IGalleryExtension[]>();
+					const zipStarted = new DeferredPromise<void>();
+					const zip = new DeferredPromise<URI>();
+					const installStarted = new DeferredPromise<void>();
+					const startInstall = new DeferredPromise<void>();
+					const installed = new DeferredPromise<ILocalExtension>();
+					const cleanupStarted = new DeferredPromise<void>();
+					const cleanup = new DeferredPromise<void>();
+					const vsix = URI.file('/cache/a.vsix');
+					instantiationService.stub(IExtensionGalleryService, 'getExtensions', () => lookup.p);
+					instantiationService.stub(IWorkbenchExtensionManagementService, 'zip', async (local: ILocalExtension) => {
+						assert.strictEqual(local, source.local);
+						await zipStarted.complete();
+						return zip.p;
+					});
+					instantiationService.stub(IFileService, 'del', async () => {
+						await cleanupStarted.complete();
+						await cleanup.p;
+					});
+					const install = async (installSource: URI | IGalleryExtension) => {
+						await startInstall.p;
+						target.install.fire({ identifier: source.identifier, source: installSource, profileLocation: null! });
+						await installStarted.complete();
+						const local = await installed.p;
+						target.complete(installSource, local);
+						return local;
+					};
+					sinon.stub(target.service, 'installFromGallery').callsFake(install);
+					target.service.install = install;
+					const states = () => ({
+						source: source.state,
+						target: container.extension?.state,
+						gallery: fixture.serverless[0].state,
+					});
+					const busyStates = { source: ExtensionState.Installed, target: ExtensionState.Installing, gallery: ExtensionState.Installing };
+					const targetLocal = aLocalExtension('a', source.local?.manifest, {
+						location: URI.from({ scheme: destination === 'local' ? Schemas.file : Schemas.vscodeRemote, path: `/extensions/${destination}/a` }),
+					});
+
+					const pending = testObject.installInServer(source, target.server);
+					try {
+						assert.deepStrictEqual(states(), busyStates);
+						assert.strictEqual(container.extension, retained);
+						const pendingTarget = testObject.installed.find(extension => extension.server === target.server)!;
+						assert.deepStrictEqual({ local: pendingTarget.local, resource: pendingTarget.resourceExtension, identifier: pendingTarget.identifier.id }, {
+							local: undefined, resource: undefined, identifier: source.identifier.id,
+						});
+						assert.ok((await testObject.queryLocal(target.server)).includes(pendingTarget));
+						if (transport === 'VSIX') {
+							assert.strictEqual(pendingTarget.displayName, source.displayName);
+							assert.strictEqual(await pendingTarget.getManifest(CancellationToken.None), source.local?.manifest);
+							await lookup.complete([]);
+							await zipStarted.p;
+							assert.deepStrictEqual(states(), busyStates);
+							await zip.complete(vsix);
+						}
+						await startInstall.complete();
+						await installStarted.p;
+						assert.deepStrictEqual(states(), busyStates);
+						await installed.complete(targetLocal);
+						if (transport === 'VSIX') {
+							await cleanupStarted.p;
+							assert.deepStrictEqual(states(), busyStates);
+							assert.strictEqual(container.extension?.local, targetLocal);
+							await cleanup.complete();
+						}
+						await pending;
+						assert.deepStrictEqual(states(), { source: ExtensionState.Installed, target: ExtensionState.Installed, gallery: idleGalleryState });
+						assert.deepStrictEqual(testObject.installed.filter(extension => extension.server === target.server).map(extension => extension.local), [targetLocal]);
+					} finally {
+						await lookup.complete([]);
+						await zip.complete(vsix);
+						await startInstall.complete();
+						await installed.complete(targetLocal);
+						await cleanup.complete();
+						await pending.catch(() => { });
+					}
+				});
+			}
+		}
+
+		for (const stage of ['gallery lookup', 'zip', 'install'] as const) {
+			test(`failed ${stage} clears destination progress and preserves the retained VSIX model`, async () => {
+				const fixture = await createFixture();
+				const source = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+				const retained = testObject.installed.find(extension => extension.server === fixture.remote.server)!;
+				const container = bind(retained);
+				fixture.remote.remove(retained);
+				const idleGalleryState = fixture.serverless[0].state;
+				const reached = new DeferredPromise<void>();
+				const failure = new DeferredPromise<never>();
+				const fail = async () => {
+					await reached.complete();
+					return failure.p;
+				};
+				instantiationService.stub(IExtensionGalleryService, 'getExtensions', stage === 'gallery lookup' ? fail : async () => []);
+				instantiationService.stub(IWorkbenchExtensionManagementService, 'zip', stage === 'zip' ? fail : async () => URI.file('/cache/a.vsix'));
+				instantiationService.stub(IFileService, 'del', async () => { });
+				fixture.remote.service.install = fail;
+				const error = stage === 'install' ? new CancellationError() : new Error(`${stage} failed`);
+				const pending = testObject.installInServer(source, fixture.remote.server);
+				try {
+					await reached.p;
+					assert.deepStrictEqual({ source: source.state, target: retained.state, retained: container.extension === retained }, {
+						source: ExtensionState.Installed, target: ExtensionState.Installing, retained: true,
+					});
+					const rejected = assert.rejects(pending, candidate => candidate === error);
+					await failure.error(error);
+					await rejected;
+					assert.deepStrictEqual({
+						source: source.state, target: retained.state, gallery: fixture.serverless[0].state,
+						retained: container.extension === retained,
+						targetInventory: testObject.installed.filter(extension => extension.server === fixture.remote.server),
+					}, { source: ExtensionState.Installed, target: ExtensionState.Uninstalled, gallery: idleGalleryState, retained: true, targetInventory: [] });
+				} finally {
+					const settled = pending.catch(() => { });
+					await failure.error(error);
+					await settled;
+				}
+			});
+		}
+
+		test('profile reset cancels pending installation without waiting for or publishing its old result', async () => {
+			const fixture = await createFixture();
+			const source = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+			const retained = testObject.installed.find(extension => extension.server === fixture.remote.server)!;
+			fixture.remote.remove(retained);
+			source.gallery = fixture.gallery[0];
+			const backend = new DeferredPromise<ILocalExtension>();
+			sinon.stub(fixture.remote.service, 'installFromGallery').returns(backend.p);
+			const pending = testObject.installInServer(source, fixture.remote.server);
+			const rejected = assert.rejects(pending, candidate => candidate instanceof CancellationError);
+			const reset = Event.toPromise(testObject.onReset);
+			fixture.remote.changeProfile.fire({ added: [], removed: [] });
+			await reset;
+			await rejected;
+			const notifications = sinon.spy();
+			disposableStore.add(testObject.onChange(notifications));
+			const subscriptions = sinon.spy(testObject, 'onChange', ['get']).get;
+			const installed = aLocalExtension('a', {}, { location: retained.local!.location });
+			try {
+				await backend.complete(installed);
+				await timeout(0);
+				assert.deepStrictEqual({
+					newSubscriptions: subscriptions.callCount,
+					notifications: notifications.callCount,
+					source: source.state,
+					targets: testObject.installed.filter(extension => extension.server === fixture.remote.server).length,
+				}, { newSubscriptions: 0, notifications: 0, source: ExtensionState.Installed, targets: 0 });
+			} finally {
+				await backend.complete(installed);
+				// Release an erroneous inventory wait as well, so a regression does not leak its listener.
+				fixture.remote.complete(fixture.gallery[0], installed);
+				await timeout(0);
+			}
+		});
+
+		test('concurrent installation ids and servers keep independent progress', async () => {
+			const fixture = await createFixture(['a', 'b'], true);
+			const sources = ['pub.a', 'pub.b'].map(id => testObject.installed.find(extension => extension.server === fixture.local.server && extension.identifier.id === id)!);
+			for (const source of sources) {
+				source.gallery = fixture.gallery.find(gallery => gallery.identifier.id === source.identifier.id);
+			}
+			for (const remote of testObject.installed.filter(extension => extension.server === fixture.remote.server)) {
+				fixture.remote.remove(remote);
+			}
+			const operations = [
+				{ source: sources[0], target: fixture.remote, result: new DeferredPromise<ILocalExtension>() },
+				{ source: sources[0], target: fixture.web, result: new DeferredPromise<ILocalExtension>() },
+				{ source: sources[1], target: fixture.remote, result: new DeferredPromise<ILocalExtension>() },
+			];
+			for (const target of [fixture.remote, fixture.web]) {
+				sinon.stub(target.service, 'installFromGallery').callsFake(async gallery => {
+					const operation = operations.find(operation => operation.target === target && operation.source.identifier.id === gallery.identifier.id)!;
+					target.install.fire({ identifier: gallery.identifier, source: gallery, profileLocation: null! });
+					const local = await operation.result.p;
+					target.complete(gallery, local);
+					return local;
+				});
+			}
+			const pending = operations.map(operation => testObject.installInServer(operation.source, operation.target.server));
+			const getStates = () => operations.map(operation => testObject.installed.find(extension => extension.server === operation.target.server && extension.identifier.id === operation.source.identifier.id)?.state);
+			const installed = operations.map(operation => aLocalExtension(operation.source.name, {}, { location: URI.from({ scheme: Schemas.vscodeRemote, path: `/extensions/${operation.target.server.id}/${operation.source.name}` }) }));
+			try {
+				assert.deepStrictEqual(getStates(), [ExtensionState.Installing, ExtensionState.Installing, ExtensionState.Installing]);
+				for (let index = 0; index < operations.length; index++) {
+					await operations[index].result.complete(installed[index]);
+					await pending[index];
+					assert.deepStrictEqual(getStates(), operations.map((_, candidate) => candidate <= index ? ExtensionState.Installed : ExtensionState.Installing));
+					assert.deepStrictEqual(sources.map(source => source.state), [ExtensionState.Installed, ExtensionState.Installed]);
+				}
+			} finally {
+				await Promise.all(operations.map((operation, index) => operation.result.complete(installed[index])));
+				await Promise.allSettled(pending);
+			}
+		});
+
+		test('retrying a gallery placeholder preserves its explicit destination server', async () => {
+			const fixture = await createFixture();
+			const source = testObject.installed.find(extension => extension.server === fixture.remote.server)!;
+			const retained = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+			fixture.local.remove(retained);
+			source.gallery = fixture.gallery[0];
+			const failed = new DeferredPromise<ILocalExtension>();
+			sinon.stub(fixture.local.service, 'installFromGallery').returns(failed.p);
+			const pending = testObject.installInServer(source, fixture.local.server);
+			const placeholder = testObject.installed.find(extension => extension.server === fixture.local.server)!;
+			const rejected = assert.rejects(pending, /failed/);
+			await failed.error(new Error('failed'));
+			await rejected;
+			const installed = aLocalExtension('a');
+			const installFromGallery = sinon.spy(async (gallery: IGalleryExtension, _options: InstallOptions, _servers?: IExtensionManagementServer[]) => {
+				fixture.local.complete(gallery, installed);
+				return installed;
+			});
+			instantiationService.stub(IWorkbenchExtensionManagementService, 'installFromGallery', installFromGallery);
+			await testObject.install(placeholder);
+			assert.deepStrictEqual(installFromGallery.firstCall.args[2], [fixture.local.server]);
+		});
 	});
 
 	test('test onchange event is triggered while installing', async () => {

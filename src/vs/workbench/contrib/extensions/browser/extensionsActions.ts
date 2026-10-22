@@ -682,7 +682,9 @@ export class InstallAction extends ExtensionAction {
 		if (this.extension?.isWorkspaceScoped && this.extension.resourceExtension && this.contextService.isInsideWorkspace(this.extension.resourceExtension.location)) {
 			return localize('install workspace version', "Install Workspace Extension");
 		}
-		if (this.extension?.server && this.extension.local && !this.extension.isWorkspaceScoped && !isLanguagePackExtension(this.extension.local.manifest)) {
+		if (this.extension?.server && !this.extension.isWorkspaceScoped
+			&& !(this.extension.local && isLanguagePackExtension(this.extension.local.manifest))
+			&& !this.extension.gallery?.properties.localizedLanguages?.length) {
 			const { localExtensionManagementServer, remoteExtensionManagementServer, webExtensionManagementServer } = this.extensionManagementServerService;
 			if ([localExtensionManagementServer, remoteExtensionManagementServer, webExtensionManagementServer].filter(server => !!server).length > 1) {
 				const preRelease = this.options.installPreReleaseVersion && this.extension.hasPreReleaseVersion;
@@ -743,15 +745,17 @@ export class InstallingLabelAction extends ExtensionAction {
 
 	constructor() {
 		super('extension.installing', InstallingLabelAction.LABEL, InstallingLabelAction.CLASS, false);
+		this.update();
 	}
 
 	update(): void {
-		this.class = `${InstallingLabelAction.CLASS}${this.extension && this.extension.state === ExtensionState.Installing ? '' : ' hide'}`;
+		this.hidden = this.extension?.state !== ExtensionState.Installing;
+		this.class = `${InstallingLabelAction.CLASS}${this.hidden ? ' hide' : ''}`;
 	}
 }
 
 function isUninstalledInSelectedServer(extension: IExtension, installed: IExtension[]): boolean {
-	return !!extension.server && !!extension.local && !extension.isBuiltin && !extension.isWorkspaceScoped
+	return !!extension.server && !extension.isBuiltin && !extension.isWorkspaceScoped
 		&& !installed.some(candidate => candidate.server === extension.server && areSameExtensions(candidate.identifier, extension.identifier));
 }
 
@@ -794,36 +798,29 @@ export abstract class InstallInOtherServerAction extends ExtensionAction {
 	update(): void {
 		this.enabled = false;
 		this.class = InstallInOtherServerAction.Class;
+		this.label = this.getInstallLabel();
+		this.tooltip = this.label;
 		if (this.extension && this.server && this.extension.server === this.server) {
 			if (this.server === this.extensionManagementServerService.webExtensionManagementServer || this.extension.gallery) {
 				return;
 			}
-			const installing = this.installing.has(ExtensionIdentifier.toKey(this.extension.identifier.id)) || this.extensionsWorkbenchService.installed.some(extension => extension.server === this.server && extension.state === ExtensionState.Installing && areSameExtensions(extension.identifier, this.extension!.identifier));
-			if (installing) {
-				this.hidden = false;
-				this.label = InstallInOtherServerAction.INSTALLING_LABEL;
-				this.class = InstallInOtherServerAction.InstallingClass;
-			} else if (getInstallSourceForSelectedServer(this.extension, this.extensionsWorkbenchService.installed, this.extensionManagementServerService)?.state === ExtensionState.Installed) {
+			if (this.extension.state === ExtensionState.Installing || this.installing.has(ExtensionIdentifier.toKey(this.extension.identifier.id))) {
+				return;
+			}
+			if (getInstallSourceForSelectedServer(this.extension, this.extensionsWorkbenchService.installed, this.extensionManagementServerService)?.state === ExtensionState.Installed) {
 				this.enabled = true;
-				this.label = this.getInstallLabel();
 			}
 			return;
 		}
 
-		if (this.canInstall()) {
-			const extensionInOtherServer = this.extensionsWorkbenchService.installed.filter(e => areSameExtensions(e.identifier, this.extension!.identifier) && e.server === this.server)[0];
-			if (extensionInOtherServer) {
-				// Getting installed in other server
-				if (extensionInOtherServer.state === ExtensionState.Installing && !extensionInOtherServer.local) {
-					this.enabled = true;
-					this.label = InstallInOtherServerAction.INSTALLING_LABEL;
-					this.class = InstallInOtherServerAction.InstallingClass;
-				}
-			} else {
-				// Not installed in other server
-				this.enabled = true;
-				this.label = this.getInstallLabel();
-			}
+		const target = this.extension && this.extensionsWorkbenchService.installed.find(extension => extension.server === this.server && areSameExtensions(extension.identifier, this.extension!.identifier));
+		if (target?.state === ExtensionState.Installing && this.extension?.state === ExtensionState.Installed && this.extension.local && !this.extension.isBuiltin && !this.extension.isWorkspaceScoped) {
+			this.hidden = false;
+			this.label = this.getInstallingLabel();
+			this.tooltip = this.label;
+			this.class = InstallInOtherServerAction.InstallingClass;
+		} else if (!target && this.canInstall() && !this.installing.has(ExtensionIdentifier.toKey(this.extension!.identifier.id))) {
+			this.enabled = true;
 		}
 	}
 
@@ -880,6 +877,9 @@ export abstract class InstallInOtherServerAction extends ExtensionAction {
 		}
 		const selected = this.extension;
 		const selectedId = ExtensionIdentifier.toKey(selected.identifier.id);
+		if (this.extensionsWorkbenchService.installed.some(extension => extension.server === this.server && areSameExtensions(extension.identifier, selected.identifier))) {
+			return;
+		}
 		const restoringSelectedServer = selected.server === this.server;
 		if (restoringSelectedServer && this.server === this.extensionManagementServerService.webExtensionManagementServer) {
 			return;
@@ -898,6 +898,16 @@ export abstract class InstallInOtherServerAction extends ExtensionAction {
 			this.installing.delete(selectedId);
 			this.update();
 		}
+	}
+
+	private getInstallingLabel(): string {
+		if (this.server === this.extensionManagementServerService.localExtensionManagementServer) {
+			return localize('installingLocally', "Installing Locally");
+		}
+		if (this.server === this.extensionManagementServerService.webExtensionManagementServer) {
+			return localize('installingInBrowser', "Installing in Browser");
+		}
+		return this.server ? localize('installingInRemote', "Installing in {0}", this.server.label) : InstallInOtherServerAction.INSTALLING_LABEL;
 	}
 
 	protected abstract getInstallLabel(): string;
@@ -1050,10 +1060,13 @@ export class UninstallAction extends ExtensionAction {
 	}
 }
 
-class UninstallInOtherServerAction extends UninstallAction {
+export class UninstallInOtherServerAction extends UninstallAction {
+
+	readonly updateWhenCounterExtensionChanges = true;
 
 	constructor(
 		private readonly server: IExtensionManagementServer,
+		private readonly visibility: 'selectedInstalled' | 'selectedUninstalled',
 		@IExtensionsWorkbenchService extensionsWorkbenchService: IExtensionsWorkbenchService,
 		@IUserDataProfilesService userDataProfilesService: IUserDataProfilesService,
 		@IDialogService dialogService: IDialogService,
@@ -1065,15 +1078,18 @@ class UninstallInOtherServerAction extends UninstallAction {
 
 	protected override getExtensionToUninstall(): IExtension | null {
 		const selected = this.extension;
-		if (!this.server || !selected?.server || selected.server === this.server || selected.isBuiltin || selected.isWorkspaceScoped || selected.state !== ExtensionState.Installed || (selected.local && isLanguagePackExtension(selected.local.manifest))) {
+		if (!this.server || !selected?.server || selected.server === this.server || selected.isBuiltin || selected.isWorkspaceScoped || (selected.local && isLanguagePackExtension(selected.local.manifest)) || selected.gallery?.properties.localizedLanguages?.length) {
 			return null;
 		}
-		// Keep the primary action scoped to the selected installation when it is removed.
 		const installed = this.extensionsWorkbenchService.installed;
-		if (!installed.some(extension => extension.server === selected.server && !extension.isWorkspaceScoped && areSameExtensions(extension.identifier, selected.identifier))) {
+		const hasSelectedInstallation = installed.some(extension => extension.server === selected.server && !extension.isWorkspaceScoped && areSameExtensions(extension.identifier, selected.identifier));
+		if (this.visibility === 'selectedInstalled'
+			? selected.state !== ExtensionState.Installed || !hasSelectedInstallation
+			: selected.state !== ExtensionState.Uninstalled || hasSelectedInstallation) {
 			return null;
 		}
-		return installed.find(extension => extension.server === this.server && !extension.isWorkspaceScoped && extension.state === ExtensionState.Installed && areSameExtensions(extension.identifier, selected.identifier)) ?? null;
+		return installed.find(extension => extension.server === this.server && extension.local && !extension.isBuiltin && !extension.isWorkspaceScoped
+			&& !isLanguagePackExtension(extension.local.manifest) && extension.state === ExtensionState.Installed && areSameExtensions(extension.identifier, selected.identifier)) ?? null;
 	}
 }
 
@@ -1090,7 +1106,7 @@ export class UninstallDropdownAction extends ButtonWithDropDownExtensionAction {
 			[
 				instantiationService.createInstance(MigrateDeprecatedExtensionAction, false),
 				instantiationService.createInstance(UninstallAction),
-				...servers.filter(server => !!server).map(server => instantiationService.createInstance(UninstallInOtherServerAction, server)),
+				...servers.filter(server => !!server).map(server => instantiationService.createInstance(UninstallInOtherServerAction, server, 'selectedInstalled')),
 				instantiationService.createInstance(InstallAnotherVersionAction, null, true),
 			]
 		]);
@@ -2750,10 +2766,12 @@ export class ExtensionStatusLabelAction extends Action implements IExtensionCont
 	private _extension: IExtension | null = null;
 	get extension(): IExtension | null { return this._extension; }
 	set extension(extension: IExtension | null) {
-		if (!(this._extension && extension && areSameExtensions(this._extension.identifier, extension.identifier))) {
-			// Different extension. Reset
+		const previous = this._extension;
+		if (!previous || !extension || !areSameExtensions(previous.identifier, extension.identifier) || (previous.server && extension.server && previous.server !== extension.server)) {
+			// Different extension or installation. Reset.
 			this.initialStatus = null;
 			this.status = null;
+			this.version = null;
 			this.enablementState = null;
 		}
 		this._extension = extension;
@@ -2788,6 +2806,9 @@ export class ExtensionStatusLabelAction extends Action implements IExtensionCont
 			this.initialStatus = this.status;
 		}
 		this.enablementState = this.extension.enablementState;
+		if (this.status === ExtensionState.Installing || this.status === ExtensionState.Uninstalling) {
+			return null;
+		}
 
 		const canAddExtension = () => {
 			const runningExtension = this.extensionService.extensions.filter(e => areSameExtensions({ id: e.identifier.value, uuid: e.uuid }, this.extension!.identifier))[0];
